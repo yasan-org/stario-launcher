@@ -6,6 +6,9 @@
   "dependencyDashboard": true,
   "dependencyDashboardApproval": true,
   "forkProcessing": "enabled",
+  "ignoreDeps": [
+    "com.github.ChickenHook:RestrictionBypass"
+  ],
   "mode": "full",
   "vulnerabilityAlerts": {
     "dependencyDashboardApproval": true

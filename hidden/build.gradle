@@ -4,16 +4,17 @@ plugins {
 }
 
 android {
-    namespace 'com.stario.launcher.hidden'
-    compileSdk 36
+    namespace = 'com.stario.launcher.hidden'
+    compileSdk = 37
+    enableKotlin = false
 
     defaultConfig {
-        minSdkVersion 29
+        minSdk = 29
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_11
-        targetCompatibility JavaVersion.VERSION_11
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
     }
 }
 

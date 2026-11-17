@@ -112,7 +112,7 @@ public class Media extends GlanceDialogExtension {
     private boolean skipUpdate;
     private ImageView forward;
     private String lastArtist;
-    private Bitmap lastCover;
+    private volatile Bitmap lastCover;
     private final Handler coverHandler = new Handler(Looper.getMainLooper());
     // At most one cover decode at a time, and only the latest pending request is kept
     // (DiscardOldestPolicy replaces it). The thread exits when idle so it can't outlive Media
@@ -120,6 +120,7 @@ public class Media extends GlanceDialogExtension {
             30, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1),
             new ThreadPoolExecutor.DiscardOldestPolicy());
     private volatile int coverRequest;
+    private int appliedCoverRequest;
     private Object[] coverKey;
     private ImageView rewind;
     private String lastSong;
@@ -606,13 +607,17 @@ public class Media extends GlanceDialogExtension {
         lastSong = "";
         lastCover = null;
         coverKey = null;
-        coverRequest++;
+        appliedCoverRequest = ++coverRequest;
     }
 
     /**
      * Resolves, compares and copies the cover on a worker thread, then applies it on the
-     * main thread. Requests superseded by a newer metadata update or a reset are dropped,
-     * and updates that leave the cover inputs unchanged don't start a new load.
+     * main thread. Updates that leave the cover inputs unchanged don't start a new load.
+     * <p>
+     * Queued requests superseded by a newer one are skipped, but a decode that already
+     * finished is still applied unless a newer result or a reset came first. Re-read
+     * metadata carries new Bitmap objects with the same pixels, so frequent updates would
+     * otherwise keep discarding every finished decode and the cover would never appear.
      */
     @MainThread
     private void loadCover(MediaMetadata metadata) {
@@ -633,7 +638,6 @@ public class Media extends GlanceDialogExtension {
         coverKey = key;
 
         final int request = ++coverRequest;
-        final Bitmap previous = lastCover;
 
         coverExecutor.execute(() -> {
             if (request != coverRequest) {
@@ -641,6 +645,8 @@ public class Media extends GlanceDialogExtension {
             }
 
             Bitmap bitmap = resolveCover(metadata);
+            // Read at decode time so a cover applied by an earlier request is compared
+            Bitmap previous = lastCover;
 
             if (bitmap == null && previous == null) {
                 return;
@@ -664,7 +670,8 @@ public class Media extends GlanceDialogExtension {
             final Bitmap result = copy;
             // Separate handler: update() clears all callbacks on `handler`
             coverHandler.post(() -> {
-                if (request == coverRequest) {
+                if (request > appliedCoverRequest) {
+                    appliedCoverRequest = request;
                     applyCover(result);
                 }
             });

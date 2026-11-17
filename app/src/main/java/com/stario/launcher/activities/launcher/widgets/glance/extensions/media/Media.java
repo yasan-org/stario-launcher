@@ -648,17 +648,12 @@ public class Media extends GlanceDialogExtension {
             // Read at decode time so a cover applied by an earlier request is compared
             Bitmap previous = lastCover;
 
-            if (bitmap == null && previous == null) {
-                return;
-            }
-
-            if (bitmap != null && previous != null &&
-                    !previous.isRecycled() && bitmap.sameAs(previous)) {
-                return;
-            }
+            final boolean unchanged = (bitmap == null && previous == null) ||
+                    (bitmap != null && previous != null &&
+                            !previous.isRecycled() && bitmap.sameAs(previous));
 
             Bitmap copy = null;
-            if (bitmap != null) {
+            if (!unchanged && bitmap != null) {
                 Bitmap.Config config = bitmap.getConfig();
                 if (config == null) {
                     config = Bitmap.Config.ARGB_8888;
@@ -670,9 +665,19 @@ public class Media extends GlanceDialogExtension {
             final Bitmap result = copy;
             // Separate handler: update() clears all callbacks on `handler`
             coverHandler.post(() -> {
-                if (request > appliedCoverRequest) {
-                    appliedCoverRequest = request;
+                if (request <= appliedCoverRequest) {
+                    return;
+                }
+
+                appliedCoverRequest = request;
+
+                if (!unchanged) {
                     applyCover(result);
+                } else if (lastCover != previous) {
+                    // An earlier result was applied after the comparison above, so the
+                    // displayed cover may differ from this one: load it again off the main thread
+                    coverKey = null;
+                    loadCover(metadata);
                 }
             });
         });

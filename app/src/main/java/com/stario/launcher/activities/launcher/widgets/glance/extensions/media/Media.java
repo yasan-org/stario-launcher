@@ -673,9 +673,10 @@ public class Media extends GlanceDialogExtension {
 
                 if (!unchanged) {
                     applyCover(result);
-                } else if (lastCover != previous) {
+                } else if (lastCover != previous && request == coverRequest) {
                     // An earlier result was applied after the comparison above, so the
-                    // displayed cover may differ from this one: load it again off the main thread
+                    // displayed cover may differ from this one: load it again off the main thread.
+                    // If a newer request exists, let it finish instead of retrying older metadata.
                     coverKey = null;
                     loadCover(metadata);
                 }

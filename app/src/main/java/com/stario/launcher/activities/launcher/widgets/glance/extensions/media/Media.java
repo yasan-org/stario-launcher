@@ -82,7 +82,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
@@ -114,9 +114,11 @@ public class Media extends GlanceDialogExtension {
     private String lastArtist;
     private Bitmap lastCover;
     private final Handler coverHandler = new Handler(Looper.getMainLooper());
-    // At most one cover decode at a time; the thread exits when idle so it can't outlive Media
+    // At most one cover decode at a time, and only the latest pending request is kept
+    // (DiscardOldestPolicy replaces it). The thread exits when idle so it can't outlive Media
     private final ExecutorService coverExecutor = new ThreadPoolExecutor(0, 1,
-            30, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+            30, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1),
+            new ThreadPoolExecutor.DiscardOldestPolicy());
     private volatile int coverRequest;
     private Object[] coverKey;
     private ImageView rewind;

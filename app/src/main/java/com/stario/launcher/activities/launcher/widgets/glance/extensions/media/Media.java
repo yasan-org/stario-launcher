@@ -77,9 +77,14 @@ import com.stario.launcher.utils.media.BlurBitmapTransformation;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import jp.wasabeef.glide.transformations.CropSquareTransformation;
 
@@ -108,7 +113,12 @@ public class Media extends GlanceDialogExtension {
     private ImageView forward;
     private String lastArtist;
     private Bitmap lastCover;
-    private int coverRequest;
+    private final Handler coverHandler = new Handler(Looper.getMainLooper());
+    // At most one cover decode at a time; the thread exits when idle so it can't outlive Media
+    private final ExecutorService coverExecutor = new ThreadPoolExecutor(0, 1,
+            30, TimeUnit.SECONDS, new LinkedBlockingQueue<>());
+    private volatile int coverRequest;
+    private Object[] coverKey;
     private ImageView rewind;
     private String lastSong;
     private ImageView cover;
@@ -593,19 +603,41 @@ public class Media extends GlanceDialogExtension {
         lastArtist = "";
         lastSong = "";
         lastCover = null;
+        coverKey = null;
         coverRequest++;
     }
 
     /**
      * Resolves, compares and copies the cover on a worker thread, then applies it on the
-     * main thread. Requests superseded by a newer metadata update or a reset are dropped.
+     * main thread. Requests superseded by a newer metadata update or a reset are dropped,
+     * and updates that leave the cover inputs unchanged don't start a new load.
      */
     @MainThread
     private void loadCover(MediaMetadata metadata) {
+        // Strings compare by value, bitmaps by identity (Bitmap doesn't override equals)
+        Object[] key = {
+                metadata.getString(MediaMetadata.METADATA_KEY_ART_URI),
+                metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI),
+                metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI),
+                metadata.getBitmap(MediaMetadata.METADATA_KEY_ART),
+                metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART),
+                metadata.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+        };
+
+        if (Arrays.equals(key, coverKey)) {
+            return;
+        }
+
+        coverKey = key;
+
         final int request = ++coverRequest;
         final Bitmap previous = lastCover;
 
-        Utils.submitTask(() -> {
+        coverExecutor.execute(() -> {
+            if (request != coverRequest) {
+                return;
+            }
+
             Bitmap bitmap = resolveCover(metadata);
 
             if (bitmap == null && previous == null) {
@@ -628,7 +660,8 @@ public class Media extends GlanceDialogExtension {
             }
 
             final Bitmap result = copy;
-            handler.post(() -> {
+            // Separate handler: update() clears all callbacks on `handler`
+            coverHandler.post(() -> {
                 if (request == coverRequest) {
                     applyCover(result);
                 }

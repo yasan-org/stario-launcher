@@ -45,8 +45,10 @@ import android.widget.ImageView;
 import android.widget.TextView;
 
 import androidx.annotation.FloatRange;
+import androidx.annotation.MainThread;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.annotation.WorkerThread;
 import androidx.constraintlayout.widget.ConstraintLayout;
 import androidx.core.app.NotificationManagerCompat;
 import androidx.core.content.res.ResourcesCompat;
@@ -75,9 +77,14 @@ import com.stario.launcher.utils.media.BlurBitmapTransformation;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import jp.wasabeef.glide.transformations.CropSquareTransformation;
 
@@ -105,7 +112,16 @@ public class Media extends GlanceDialogExtension {
     private boolean skipUpdate;
     private ImageView forward;
     private String lastArtist;
-    private Bitmap lastCover;
+    private volatile Bitmap lastCover;
+    private final Handler coverHandler = new Handler(Looper.getMainLooper());
+    // At most one cover decode at a time, and only the latest pending request is kept
+    // (DiscardOldestPolicy replaces it). The thread exits when idle so it can't outlive Media
+    private final ExecutorService coverExecutor = new ThreadPoolExecutor(0, 1,
+            30, TimeUnit.SECONDS, new ArrayBlockingQueue<>(1),
+            new ThreadPoolExecutor.DiscardOldestPolicy());
+    private volatile int coverRequest;
+    private int appliedCoverRequest;
+    private Object[] coverKey;
     private ImageView rewind;
     private String lastSong;
     private ImageView cover;
@@ -571,38 +587,7 @@ public class Media extends GlanceDialogExtension {
             }
         });
 
-        String coverUri = metadata.getString(MediaMetadata.METADATA_KEY_ART_URI);
-
-        if (coverUri == null || coverUri.isBlank()) {
-            coverUri = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI);
-        }
-
-        if (coverUri == null || coverUri.isBlank()) {
-            coverUri = metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI);
-        }
-
-        boolean result = false;
-        if (coverUri != null && !coverUri.isBlank()) {
-            result = updateCover(coverUri);
-        }
-
-        if (!result) {
-            Bitmap coverBmp = metadata.getBitmap(MediaMetadata.METADATA_KEY_ART);
-
-            if (coverBmp == null ||
-                    coverBmp.getWidth() < MIN_BITMAP_SIZE ||
-                    coverBmp.getHeight() < MIN_BITMAP_SIZE) {
-                coverBmp = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
-            }
-
-            if (coverBmp == null ||
-                    coverBmp.getWidth() < MIN_BITMAP_SIZE ||
-                    coverBmp.getHeight() < MIN_BITMAP_SIZE) {
-                coverBmp = metadata.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON);
-            }
-
-            updateCover(coverBmp);
-        }
+        loadCover(metadata);
 
         updatePlaybackState();
     }
@@ -621,49 +606,137 @@ public class Media extends GlanceDialogExtension {
         lastArtist = "";
         lastSong = "";
         lastCover = null;
+        coverKey = null;
+        appliedCoverRequest = ++coverRequest;
     }
 
-    public boolean updateCover(String stringUri) {
-        if (stringUri != null) {
-            try {
-                InputStream inputStream;
-                Uri uri = Uri.parse(stringUri);
+    /**
+     * Resolves, compares and copies the cover on a worker thread, then applies it on the
+     * main thread. Updates that leave the cover inputs unchanged don't start a new load.
+     * <p>
+     * Queued requests superseded by a newer one are skipped, but a decode that already
+     * finished is still applied unless a newer result or a reset came first. Re-read
+     * metadata carries new Bitmap objects with the same pixels, so frequent updates would
+     * otherwise keep discarding every finished decode and the cover would never appear.
+     */
+    @MainThread
+    private void loadCover(MediaMetadata metadata) {
+        // Strings compare by value, bitmaps by identity (Bitmap doesn't override equals)
+        Object[] key = {
+                metadata.getString(MediaMetadata.METADATA_KEY_ART_URI),
+                metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI),
+                metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI),
+                metadata.getBitmap(MediaMetadata.METADATA_KEY_ART),
+                metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART),
+                metadata.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON)
+        };
 
-                if (uri != null && "content".equals(uri.getScheme())) {
-                    inputStream = activity.getContentResolver().openInputStream(uri);
-                } else {
-                    inputStream = new FileInputStream(stringUri);
+        if (Arrays.equals(key, coverKey)) {
+            return;
+        }
+
+        coverKey = key;
+
+        final int request = ++coverRequest;
+
+        coverExecutor.execute(() -> {
+            if (request != coverRequest) {
+                return;
+            }
+
+            Bitmap bitmap = resolveCover(metadata);
+            // Read at decode time so a cover applied by an earlier request is compared
+            Bitmap previous = lastCover;
+
+            final boolean unchanged = (bitmap == null && previous == null) ||
+                    (bitmap != null && previous != null &&
+                            !previous.isRecycled() && bitmap.sameAs(previous));
+
+            Bitmap copy = null;
+            if (!unchanged && bitmap != null) {
+                Bitmap.Config config = bitmap.getConfig();
+                if (config == null) {
+                    config = Bitmap.Config.ARGB_8888;
                 }
 
-                updateCover(BitmapFactory.decodeStream(inputStream));
-
-                return true;
-            } catch (Exception exception) {
-                return false;
+                copy = bitmap.copy(config, false);
             }
-        }
 
-        return false;
+            final Bitmap result = copy;
+            // Separate handler: update() clears all callbacks on `handler`
+            coverHandler.post(() -> {
+                if (request <= appliedCoverRequest) {
+                    return;
+                }
+
+                appliedCoverRequest = request;
+
+                if (!unchanged) {
+                    applyCover(result);
+                } else if (lastCover != previous && request == coverRequest) {
+                    // An earlier result was applied after the comparison above, so the
+                    // displayed cover may differ from this one: load it again off the main thread.
+                    // If a newer request exists, let it finish instead of retrying older metadata.
+                    coverKey = null;
+                    loadCover(metadata);
+                }
+            });
+        });
     }
 
-    public void updateCover(Bitmap bitmap) {
-        if (bitmap == null && lastCover == null) {
-            return;
+    @WorkerThread
+    private Bitmap resolveCover(MediaMetadata metadata) {
+        String coverUri = metadata.getString(MediaMetadata.METADATA_KEY_ART_URI);
+
+        if (coverUri == null || coverUri.isBlank()) {
+            coverUri = metadata.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI);
         }
 
-        if (bitmap != null && lastCover != null &&
-                !lastCover.isRecycled() && bitmap.sameAs(lastCover)) {
-            return;
+        if (coverUri == null || coverUri.isBlank()) {
+            coverUri = metadata.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI);
         }
 
-        if (bitmap != null) {
-            Bitmap.Config config = bitmap.getConfig();
-            if (config == null) {
-                config = Bitmap.Config.ARGB_8888;
+        if (coverUri != null && !coverUri.isBlank()) {
+            Bitmap decoded = decodeCover(coverUri);
+
+            if (decoded != null) {
+                return decoded;
             }
+        }
 
-            bitmap = bitmap.copy(config, false);
+        Bitmap coverBmp = metadata.getBitmap(MediaMetadata.METADATA_KEY_ART);
 
+        if (coverBmp == null ||
+                coverBmp.getWidth() < MIN_BITMAP_SIZE ||
+                coverBmp.getHeight() < MIN_BITMAP_SIZE) {
+            coverBmp = metadata.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART);
+        }
+
+        if (coverBmp == null ||
+                coverBmp.getWidth() < MIN_BITMAP_SIZE ||
+                coverBmp.getHeight() < MIN_BITMAP_SIZE) {
+            coverBmp = metadata.getBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON);
+        }
+
+        return coverBmp;
+    }
+
+    @WorkerThread
+    private Bitmap decodeCover(String stringUri) {
+        Uri uri = Uri.parse(stringUri);
+
+        try (InputStream inputStream = uri != null && "content".equals(uri.getScheme()) ?
+                activity.getContentResolver().openInputStream(uri) :
+                new FileInputStream(stringUri)) {
+            return inputStream != null ? BitmapFactory.decodeStream(inputStream) : null;
+        } catch (Exception exception) {
+            return null;
+        }
+    }
+
+    @MainThread
+    private void applyCover(Bitmap bitmap) {
+        if (bitmap != null) {
             DrawableCrossFadeFactory factory =
                     new DrawableCrossFadeFactory.Builder()
                             .setCrossFadeEnabled(true).build();
